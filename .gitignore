@@ -1,0 +1,10 @@
+# Google API credentials - NEVER commit
+*.json
+!config.example.json
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
