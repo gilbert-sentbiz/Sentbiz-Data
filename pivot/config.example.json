@@ -1,5 +1,4 @@
 {
-  "credentials_path": "/path/to/your-service-account.json",
   "sheets": [
     { "name": "sheet1", "url": "https://docs.google.com/spreadsheets/d/..." },
     { "name": "sheet2", "url": "https://docs.google.com/spreadsheets/d/..." },
