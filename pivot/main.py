@@ -1,11 +1,12 @@
 import json
 import gspread
-from sheets import sheet1
+from sheets import sheet1, sheet2
 
 CONFIG_PATH = "config.json"
 
 SHEET_MODULES = {
     "sheet1": sheet1,
+    "sheet2": sheet2,
 }
 
 
