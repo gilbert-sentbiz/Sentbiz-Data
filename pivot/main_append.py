@@ -1,12 +1,35 @@
 import os
 import math
-from datetime import datetime
+from datetime import datetime, date as _date
 import pandas as pd
 import gspread
 
+SHEETS_EPOCH = _date(1899, 12, 30)
+
+def to_serial_date(val):
+    """DD/MM/YYYY 문자열 → Google Sheets 날짜 시리얼 숫자"""
+    try:
+        dt = datetime.strptime(str(val), "%d/%m/%Y").date()
+        return (dt - SHEETS_EPOCH).days
+    except (ValueError, TypeError):
+        return val
+
+
+def load_week_mapping(sh):
+    """Week Mapping 탭에서 {날짜 시리얼: 주차 레이블} 딕셔너리 반환"""
+    wm = sh.worksheet("Week Mapping")
+    mapping = {}
+    for row in wm.get_all_values()[1:]:  # 헤더 스킵
+        if len(row) >= 5 and row[4]:
+            try:
+                mapping[int(float(row[4]))] = row[3]
+            except (ValueError, IndexError):
+                pass
+    return mapping
+
 # ── 설정 ──────────────────────────────────────────────────────────────
-INPUT_FOLDER     = "/Users/gilbert/Desktop/Sentbiz Data"         # xlsx 파일들이 있는 로컬 폴더
-OUTPUT_FOLDER_ID = "1mldXezakLMwLD-NZ_bz06zV_i3aaeVjb"          # Google Drive 폴더 ID
+INPUT_FOLDER    = "/Users/gilbert/Desktop/Sentbiz Data"
+MASTER_SHEET_ID = "1m1scU5eLl-WmOVB7FgzR_RN7avwxIdOGx-90kusDcqI"
 # ──────────────────────────────────────────────────────────────────────
 
 HEADERS = [
@@ -151,7 +174,7 @@ PIVOT_FUNCS = {
 }
 
 
-# ── 메인 ─────────────────────────────────────────────────────────────
+# ── 유틸 ─────────────────────────────────────────────────────────────
 
 def clean(v):
     if v is None:
@@ -162,6 +185,67 @@ def clean(v):
         return str(v)
     return v
 
+
+def rows_to_weeks(rows, week_mapping):
+    """시리얼 날짜(index 8)에서 시트 기준 주차 레이블 추출"""
+    weeks = set()
+    for row in rows:
+        serial = row[8]
+        if isinstance(serial, (int, float)):
+            label = week_mapping.get(int(serial))
+            if label:
+                weeks.add(label)
+    return weeks
+
+
+def delete_weeks(ws, target_weeks):
+    """Data 탭에서 target_weeks에 해당하는 행을 삭제 (Week 컬럼 = index 15)"""
+    all_vals = ws.get_all_values()
+    WEEK_COL = 15  # 0-based
+
+    to_delete = [
+        i + 2
+        for i, row in enumerate(all_vals[1:])
+        if len(row) > WEEK_COL and row[WEEK_COL] in target_weeks
+    ]
+
+    if not to_delete:
+        return 0, len(all_vals)
+
+    ranges = []
+    start = end = to_delete[0]
+    for r in to_delete[1:]:
+        if r == end + 1:
+            end = r
+        else:
+            ranges.append((start, end))
+            start = end = r
+    ranges.append((start, end))
+
+    for s, e in reversed(ranges):
+        ws.delete_rows(s, e)
+
+    return len(to_delete), len(all_vals) - len(to_delete)
+
+
+def write_formulas(ws, start_row, num_rows):
+    """새로 추가된 행(start_row~)에 P~V 수식을 직접 생성해서 쓴다."""
+    formula_rows = []
+    for r in range(start_row, start_row + num_rows):
+        formula_rows.append([
+            f"=XLOOKUP(I{r},'Week Mapping'!$A$2:$A$733,'Week Mapping'!$D$2:$D$733)",
+            f"=L{r}+M{r}",
+            f"=L{r}+M{r}-N{r}-O{r}",
+            f"=month(I{r})",
+            f"=year(I{r})",
+            f'=if(or(B{r}="KR MERCHANT",B{r}="KR FI"),"Glenn","Valex")',
+            f'=if(or(B{r}="KR MERCHANT",B{r}="KR FI"),"Joyce","Bernice")',
+        ])
+    ws.update(formula_rows, f"P{start_row}:V{start_row + num_rows - 1}",
+              value_input_option="USER_ENTERED")
+
+
+# ── 메인 ─────────────────────────────────────────────────────────────
 
 def main():
     xlsx_files = sorted(f for f in os.listdir(INPUT_FOLDER) if f.endswith(".xlsx"))
@@ -186,26 +270,30 @@ def main():
         all_rows.extend(rows)
         print(f"  {fname} → {source} ({len(rows)} rows)")
 
-    print(f"총 {len(all_rows)} rows → Google Sheet 생성 중...")
-
     all_rows = [[clean(v) for v in row] for row in all_rows]
 
-    # Client Segment(index 1) 대문자 정규화
+    # Client Segment(index 1) 대문자 정규화, 날짜(index 8) 시리얼 변환
     for row in all_rows:
         if isinstance(row[1], str):
             row[1] = row[1].upper().strip()
+        row[8] = to_serial_date(row[8])
 
     gc = gspread.oauth()
-    title = datetime.today().strftime("%Y%m%d") + "_GBD_Data"
-    try:
-        sh = gc.open(title)
-        sh.sheet1.clear()
-        print(f"기존 시트 덮어쓰는 중: {title}")
-    except gspread.SpreadsheetNotFound:
-        sh = gc.create(title, folder_id=OUTPUT_FOLDER_ID)
-    sh.sheet1.update([HEADERS] + all_rows, "A1")
+    sh = gc.open_by_key(MASTER_SHEET_ID)
+    ws = sh.worksheet("Data")
 
-    print(f"완료: {sh.url}")
+    week_mapping = load_week_mapping(sh)
+    target_weeks = rows_to_weeks(all_rows, week_mapping)
+    print(f"대상 주차: {sorted(target_weeks)}")
+
+    deleted, remaining = delete_weeks(ws, target_weeks)
+    if deleted:
+        print(f"기존 {deleted} rows 삭제 완료")
+
+    ws.append_rows(all_rows, value_input_option="USER_ENTERED")
+    start_row = remaining + 1  # 헤더 포함 remaining행 다음부터
+    write_formulas(ws, start_row, len(all_rows))
+    print(f"완료: {len(all_rows)} rows → Data 탭에 추가됨 (수식 작성 완료)")
 
 
 if __name__ == "__main__":
